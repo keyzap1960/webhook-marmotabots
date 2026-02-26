@@ -1,177 +1,96 @@
 const express = require('express');
-const admin = require('firebase-admin');
 const app = express();
+
 app.use(express.json());
 
-const VERIFY_TOKEN = 'marmotabots123';
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
-
-// Firebase
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-const db = admin.firestore();
-
-// CORS para Flutter web
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key, anthropic-version');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
-
-// Verificación webhook WhatsApp
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+  if (mode === 'subscribe' && token === 'marmotabots123') {
     res.status(200).send(challenge);
   } else {
     res.sendStatus(403);
   }
 });
 
-// Recibir mensajes WhatsApp
-app.post('/webhook', async (req, res) => {
+app.post('/webhook', (req, res) => {
+  res.sendStatus(200);
+});
+
+app.post('/claude', async (req, res) => {
   try {
-    const body = req.body;
-    if (body.object === 'whatsapp_business_account') {
-      const messages = body.entry?.[0]?.changes?.[0]?.value?.messages;
-      if (messages && messages.length > 0) {
-        const msg = messages[0];
-        const from = msg.from;
-        const text = msg.text?.body || '';
-        const timestamp = new Date(parseInt(msg.timestamp) * 1000);
-        const usersSnap = await db.collection('users').where('whatsapp', '==', from).get();
-        if (!usersSnap.empty) {
-          const userId = usersSnap.docs[0].id;
-          await db.collection('users').doc(userId).collection('chats').add({
-            message: text, from: from, timestamp: timestamp, isBot: false, platform: 'whatsapp'
-          });
-        }
+    const { message, products, history } = req.body;
+    if (!message) return res.status(400).json({ error: 'Mensaje requerido' });
+
+    const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
+    if (!CLAUDE_API_KEY) return res.status(500).json({ error: 'API key no configurada' });
+
+    const messages = [];
+    if (history && history.length > 0) {
+      for (const msg of history) {
+        messages.push({ role: msg.role === 'assistant' ? 'assistant' : 'user', content: msg.content });
       }
     }
-    res.sendStatus(200);
-  } catch (e) {
-    console.error('Error webhook:', e);
-    res.sendStatus(500);
+    messages.push({ role: 'user', content: message });
+
+    const systemPrompt = `Eres un asesor de ventas real llamado "Mia". Trabajas para este negocio y conoces todos sus productos.
+
+CÓMO DEBES HABLAR:
+- Como una persona real, cálida y cercana. Nada de robots.
+- Respuestas CORTAS: máximo 3 líneas. Si el cliente quiere más info, él pregunta.
+- NUNCA listes todo el catálogo de una vez. Pregunta qué necesita primero.
+- Usa UN emoji máximo por mensaje, no en cada línea.
+- NUNCA uses asteriscos (**) ni markdown. Solo texto normal.
+- Si no sabes algo, dilo con naturalidad: "Eso sí no te puedo confirmar ahora mismo"
+- Cuando el cliente muestre interés, guíalo suavemente hacia la compra.
+- Habla como si estuvieras en WhatsApp con un amigo, pero profesional.
+
+EJEMPLOS DE CÓMO RESPONDER:
+Cliente: "¿Qué tienen?"
+Tú: "Hola! Cuéntame, ¿qué estás buscando? Así te muestro lo que más te conviene 😊"
+
+Cliente: "¿Cuánto cuesta el producto X?"
+Tú: "El X está en $XX. ¿Te lo enviamos o prefieres pasar a recogerlo?"
+
+Cliente: "Quiero comprar"
+Tú: "Perfecto! Te confirmo la disponibilidad ahora mismo. ¿A qué dirección te lo mandamos?"
+
+${products ? 'PRODUCTOS DEL NEGOCIO:\n' + products : 'Por el momento no hay productos cargados.'}
+
+Recuerda: eres Mia, una persona real. Nunca digas que eres una IA o un bot.`;
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': CLAUDE_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 300,
+        system: systemPrompt,
+        messages: messages
+      })
+    });
+
+    const data = await response.json();
+    if (data.content && data.content[0]) {
+      return res.json({ text: data.content[0].text });
+    } else {
+      console.error('Error Claude:', JSON.stringify(data));
+      return res.json({ text: 'Hola! Estoy aquí para ayudarte. ¿Qué necesitas?' });
+    }
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ text: 'Perdona, tuve un problemita. ¿Me repites?' });
   }
 });
 
-// Detectar agenda e intención
-async function detectarAgenda(message) {
-  try {
-    const prompt = `Analiza este mensaje: "${message}"
-Responde SOLO con este JSON sin texto adicional:
-{"tieneInteres":true/false,"tieneFecha":true/false,"fecha":"fecha o null","tipo":"agenda/interes/ninguno"}`;
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': CLAUDE_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 150,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
-    const data = await response.json();
-    return JSON.parse(data.content[0].text.trim());
-  } catch (e) {
-    return null;
-  }
-}
-
-// Claude bot con agendamiento inteligente
-app.post('/claude', async (req, res) => {
-  try {
-    const { message, products, history, customerId, userId } = req.body;
-
-    if (!CLAUDE_API_KEY) {
-      return res.status(500).json({ text: 'API key no configurada.' });
-    }
-
-    // Detectar agenda
-    const deteccion = await detectarAgenda(message);
-
-    // Guardar en Firebase si hay fecha o interés
-    if (deteccion && userId && customerId) {
-      if (deteccion.tieneFecha && deteccion.fecha) {
-        await db.collection('users').doc(userId).collection('agendas').add({
-          customerId: customerId,
-          fecha: deteccion.fecha,
-          mensaje: message,
-          estado: 'pendiente',
-          timestamp: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        await db.collection('users').doc(userId)
-          .collection('customers').doc(customerId)
-          .update({ status: 'agendado', fechaAgenda: deteccion.fecha })
-          .catch(() => {});
-      } else if (deteccion.tieneInteres) {
-        await db.collection('users').doc(userId)
-          .collection('customers').doc(customerId)
-          .update({ status: 'interesado' })
-          .catch(() => {});
-      }
-    }
-
-    const messages = history && history.length > 0
-      ? [...history, { role: 'user', content: message }]
-      : [{ role: 'user', content: message }];
-
-    const systemPrompt = `Eres un asistente de ventas experto y amigable. Responde siempre en español. Sé conciso y cálido.
-
-INSTRUCCIONES:
-- Si el cliente muestra interés, pregúntale: "¿Te gustaría agendar una cita? ¿Qué día y hora te queda bien?"
-- Si menciona una fecha como "el 20", "el martes", confirma: "Perfecto, te anoto para [fecha]. ¿A qué hora?"
-- Si da fecha y hora, confirma: "Listo, queda anotado para [fecha] a las [hora]. Te contactaremos entonces 😊"
-- Sé orientado a cerrar ventas.
-${products ? 'Productos: ' + products : ''}`;
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': CLAUDE_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 1024,
-        system: systemPrompt,
-        messages: messages,
-      }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('Error Claude API:', response.status, errorText);
-      return res.status(500).json({ text: 'Error al conectar con el asistente.' });
-    }
-
-    const data = await response.json();
-
-    if (!data.content || data.content.length === 0) {
-      return res.status(500).json({ text: 'El asistente no pudo responder.' });
-    }
-
-    res.json({
-      text: data.content[0].text,
-      agendaDetectada: deteccion?.tieneFecha || false,
-      interesDetectado: deteccion?.tieneInteres || false,
-    });
-
-  } catch (e) {
-    console.error('Error Claude:', e);
-    res.status(500).json({ text: 'Error al procesar tu mensaje.' });
-  }
+app.get('/', (req, res) => {
+  res.json({ status: 'MarmotaBots server corriendo ✅' });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Webhook corriendo en puerto ' + PORT));
+app.listen(PORT, () => console.log('Servidor corriendo en puerto ' + PORT));
