@@ -41,30 +41,107 @@ app.post('/webhook', async (req, res) => {
         const msg = messages[0];
         const from = msg.from;
         const text = msg.text?.body || '';
+
+        // Buscar usuario (negocio) por número de WhatsApp
         const usersSnap = await db.collection('users').where('whatsapp', '==', from).get();
         let userId = null;
         let products = '';
+        let historial = [];
+
         if (!usersSnap.empty) {
           userId = usersSnap.docs[0].id;
-          await db.collection('users').doc(userId).collection('chats').add({
-            message: text, from: from, timestamp: new Date(), isBot: false, platform: 'whatsapp'
+
+          // Referencia al cliente dentro del negocio
+          const customerRef = db
+            .collection('users').doc(userId)
+            .collection('customers').doc(from);
+
+          const customerDoc = await customerRef.get();
+
+          if (!customerDoc.exists) {
+            await customerRef.set({
+              phone: from,
+              name: from,
+              platform: 'whatsapp',
+              createdAt: new Date(),
+              lastMessage: text,
+              lastMessageTime: new Date(),
+              interestLevel: 1,
+            });
+          } else {
+            await customerRef.update({
+              lastMessage: text,
+              lastMessageTime: new Date(),
+            });
+          }
+
+          // Guardar mensaje del cliente
+          await customerRef.collection('messages').add({
+            message: text,
+            from: from,
+            timestamp: new Date(),
+            isBot: false,
+            platform: 'whatsapp',
           });
-          const productsSnap = await db.collection('users').doc(userId).collection('products').get();
+
+          // Obtener historial reciente
+          const histSnap = await customerRef
+            .collection('messages')
+            .orderBy('timestamp', 'desc')
+            .limit(10)
+            .get();
+
+          historial = histSnap.docs.reverse().map(d => ({
+            role: d.data().isBot ? 'assistant' : 'user',
+            content: d.data().message,
+          }));
+
+          // Obtener productos
+          const productsSnap = await db
+            .collection('users').doc(userId)
+            .collection('products').get();
+
           if (!productsSnap.empty) {
             products = productsSnap.docs.map(d =>
               `- ${d.data().name}: $${d.data().price} - ${d.data().description || ''}`
             ).join('\n');
           }
+
+          // Incrementar chats usados
+          await db.collection('users').doc(userId).update({
+            chatsUsed: admin.firestore.FieldValue.increment(1),
+          });
         }
-        const botReply = await getCloudeResponse(text, products, []);
+
+        const botReply = await getClaudeResponse(text, products, historial);
+
+        // Enviar por WhatsApp
         await fetch(`https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
-          body: JSON.stringify({ messaging_product: 'whatsapp', to: from, type: 'text', text: { body: botReply } }),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+          },
+          body: JSON.stringify({
+            messaging_product: 'whatsapp',
+            to: from,
+            type: 'text',
+            text: { body: botReply },
+          }),
         });
+
+        // Guardar respuesta del bot
         if (userId) {
-          await db.collection('users').doc(userId).collection('chats').add({
-            message: botReply, from: 'bot', timestamp: new Date(), isBot: true, platform: 'whatsapp'
+          const customerRef = db
+            .collection('users').doc(userId)
+            .collection('customers').doc(from);
+
+          await customerRef.collection('messages').add({
+            message: botReply,
+            from: 'bot',
+            timestamp: new Date(),
+            isBot: true,
+            platform: 'whatsapp',
           });
         }
       }
@@ -79,7 +156,7 @@ app.post('/webhook', async (req, res) => {
 app.post('/claude', async (req, res) => {
   try {
     const { message, products, history } = req.body;
-    const text = await getCloudeResponse(message, products, history);
+    const text = await getClaudeResponse(message, products, history);
     res.json({ text });
   } catch (e) {
     console.error('Error Claude:', e);
@@ -87,7 +164,7 @@ app.post('/claude', async (req, res) => {
   }
 });
 
-async function getCloudeResponse(message, products, history) {
+async function getClaudeResponse(message, products, history) {
   const messages = history && history.length > 0
     ? [...history, { role: 'user', content: message }]
     : [{ role: 'user', content: message }];
