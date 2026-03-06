@@ -47,16 +47,18 @@ app.post('/webhook', async (req, res) => {
         let userId = null;
         let products = '';
         let historial = [];
+        let businessName = 'Tu negocio';
 
         if (!usersSnap.empty) {
           userId = usersSnap.docs[0].id;
+          businessName = usersSnap.docs[0].data().businessName || 'Tu negocio';
 
-          // Referencia al cliente dentro del negocio
           const customerRef = db
             .collection('users').doc(userId)
             .collection('customers').doc(from);
 
           const customerDoc = await customerRef.get();
+          let customerName = from;
 
           if (!customerDoc.exists) {
             await customerRef.set({
@@ -69,6 +71,7 @@ app.post('/webhook', async (req, res) => {
               interestLevel: 1,
             });
           } else {
+            customerName = customerDoc.data().name || from;
             await customerRef.update({
               lastMessage: text,
               lastMessageTime: new Date(),
@@ -78,13 +81,15 @@ app.post('/webhook', async (req, res) => {
           // Guardar mensaje del cliente
           await customerRef.collection('messages').add({
             message: text,
+            text: text,
             from: from,
+            sender: 'user',
             timestamp: new Date(),
             isBot: false,
             platform: 'whatsapp',
           });
 
-          // Obtener historial reciente
+          // Obtener historial
           const histSnap = await customerRef
             .collection('messages')
             .orderBy('timestamp', 'desc')
@@ -93,7 +98,7 @@ app.post('/webhook', async (req, res) => {
 
           historial = histSnap.docs.reverse().map(d => ({
             role: d.data().isBot ? 'assistant' : 'user',
-            content: d.data().message,
+            content: d.data().message || d.data().text || '',
           }));
 
           // Obtener productos
@@ -111,6 +116,49 @@ app.post('/webhook', async (req, res) => {
           await db.collection('users').doc(userId).update({
             chatsUsed: admin.firestore.FieldValue.increment(1),
           });
+
+          // ══════════════════════════════════════
+          // ENVIAR NOTIFICACIÓN PUSH AL DUEÑO
+          // ══════════════════════════════════════
+          try {
+            const userDoc = await db.collection('users').doc(userId).get();
+            const fcmToken = userDoc.data()?.fcmToken;
+
+            if (fcmToken) {
+              await admin.messaging().send({
+                token: fcmToken,
+                notification: {
+                  title: `💬 Nuevo mensaje de ${customerName}`,
+                  body: text.length > 80 ? text.substring(0, 80) + '...' : text,
+                },
+                data: {
+                  customerId: from,
+                  customerName: customerName,
+                  type: 'new_message',
+                },
+                android: {
+                  priority: 'high',
+                  notification: {
+                    sound: 'default',
+                    channelId: 'messages',
+                  },
+                },
+                webpush: {
+                  notification: {
+                    icon: '/icons/Icon-192.png',
+                    badge: '/icons/Icon-192.png',
+                    sound: 'default',
+                  },
+                  fcmOptions: {
+                    link: '/#/chats',
+                  },
+                },
+              });
+              console.log('✅ Notificación enviada a:', userId);
+            }
+          } catch (notifError) {
+            console.error('Error notificación:', notifError);
+          }
         }
 
         const botReply = await getClaudeResponse(text, products, historial);
@@ -138,10 +186,17 @@ app.post('/webhook', async (req, res) => {
 
           await customerRef.collection('messages').add({
             message: botReply,
+            text: botReply,
             from: 'bot',
+            sender: 'assistant',
             timestamp: new Date(),
             isBot: true,
             platform: 'whatsapp',
+          });
+
+          await customerRef.update({
+            lastMessage: botReply,
+            lastMessageTime: new Date(),
           });
         }
       }
@@ -196,3 +251,4 @@ app.get('/', (req, res) => res.json({ status: 'MarmotaBots ✅' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor corriendo en puerto ' + PORT));
+
